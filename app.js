@@ -6,6 +6,7 @@ let allEvents = [];
 let filteredEvents = [];
 let currentPage = 1;
 const pageSize = 10;
+let loadGeneration = 0; // bumped on every fetchData so a stale load stops
 
 // Chart Instances
 let timelineChart = null;
@@ -180,22 +181,35 @@ async function fetchData() {
     </tr>
   `;
   
+  const gen = ++loadGeneration;
+  allEvents = [];
+  filteredEvents = [];
+  currentPage = 1;
+
   try {
-    // 1. Fetch from local Supabase events (instant)
-    const { data, error } = await supabaseClient
-      .from('v_supabase_analytics')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(1000);
+    // 1. Load every Supabase event, rendering progressively as days arrive
+    let lastRender = 0;
+    const { total, failedPages } = await loadAllSupabaseEvents(supabaseClient, {
+      isCancelled: () => gen !== loadGeneration,
+      onRows: (rows, loaded, expected) => {
+        if (gen !== loadGeneration) return;
+        for (const row of rows) allEvents.push(row);
+        const pct = expected ? Math.min(99, Math.floor((loaded / expected) * 100)) : 0;
+        updateStatus('loading', `<i class="fa-solid fa-circle-notch fa-spin"></i> Loading ${loaded.toLocaleString()} / ${expected.toLocaleString()} (${pct}%)`);
+        if (Date.now() - lastRender > 2000) {
+          lastRender = Date.now();
+          sortAndRender();
+        }
+      },
+    });
+    if (gen !== loadGeneration) return;
 
-    if (error) throw error;
-
-    allEvents = data || [];
-    filteredEvents = [...allEvents];
-    currentPage = 1;
-
-    updateStatus('connected', '<i class="fa-solid fa-circle-check"></i> Connected (Supabase Only)');
-    filterAndRender();
+    sortAndRender();
+    if (failedPages > 0) {
+      updateStatus('disconnected', `<i class="fa-solid fa-triangle-exclamation"></i> Loaded ${allEvents.length.toLocaleString()} of ${total.toLocaleString()} (${failedPages} page(s) failed, press Refresh)`);
+    } else {
+      updateStatus('connected', `<i class="fa-solid fa-circle-check"></i> Connected (${allEvents.length.toLocaleString()} Supabase events)`);
+    }
 
     // 2. Fetch Neon DB logs in the background asynchronously
     fetchNeonData();
@@ -212,6 +226,86 @@ async function fetchData() {
       </tr>
     `;
   }
+}
+
+// Newest first. PostgREST returns ISO-8601 UTC strings, which sort correctly as
+// plain strings and avoid parsing dates millions of times on 250k+ rows.
+function compareNewestFirst(a, b) {
+  return a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0;
+}
+
+function sortAndRender() {
+  allEvents.sort(compareNewestFirst);
+  filterAndRender();
+}
+
+// PostgREST returns at most 1000 rows per request, so split the full range into
+// one-day slices, fetch several slices in parallel, and page inside each slice
+// with a (created_at, id) cursor so rows sharing a timestamp are never skipped.
+async function loadAllSupabaseEvents(client, { onRows, isCancelled, concurrency = 6 }) {
+  const VIEW = 'v_supabase_analytics';
+  const PAGE = 1000;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  const [{ count, error: countError }, { data: oldest, error: oldestError }] = await Promise.all([
+    client.from(VIEW).select('id', { count: 'exact', head: true }),
+    client.from(VIEW).select('created_at').order('created_at', { ascending: true }).limit(1),
+  ]);
+  if (countError) throw countError;
+  if (oldestError) throw oldestError;
+  const total = count || 0;
+  if (!oldest || oldest.length === 0) return { total, failedPages: 0 };
+
+  // Newest day first, so recent data shows up first
+  const slices = [];
+  const startMs = Date.parse(oldest[0].created_at);
+  for (let end = Date.now() + 60 * 1000; end > startMs; end -= DAY_MS) {
+    slices.push([new Date(Math.max(end - DAY_MS, startMs)).toISOString(), new Date(end).toISOString()]);
+  }
+
+  let loaded = 0;
+  let failedPages = 0;
+
+  async function fetchPage(from, to, cursor) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let q = client.from(VIEW).select('*')
+        .gte('created_at', from)
+        .lt('created_at', to)
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(PAGE);
+      if (cursor) {
+        q = q.or(`created_at.lt."${cursor.created_at}",and(created_at.eq."${cursor.created_at}",id.lt.${cursor.id})`);
+      }
+      const { data, error } = await q;
+      if (!error) return data || [];
+      console.warn(`Page ${from}..${to} failed (attempt ${attempt + 1}):`, error);
+      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+    }
+    return null;
+  }
+
+  async function loadSlice([from, to]) {
+    let cursor = null;
+    while (!isCancelled()) {
+      const rows = await fetchPage(from, to, cursor);
+      if (rows === null) { failedPages++; return; }
+      if (rows.length === 0) return;
+      loaded += rows.length;
+      onRows(rows, loaded, Math.max(total, loaded));
+      if (rows.length < PAGE) return;
+      cursor = rows[rows.length - 1];
+    }
+  }
+
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, slices.length) }, async () => {
+    while (next < slices.length && !isCancelled()) {
+      await loadSlice(slices[next++]);
+    }
+  });
+  await Promise.all(workers);
+  return { total, failedPages };
 }
 
 // Asynchronously fetch Neon DB events and merge them
@@ -235,7 +329,7 @@ async function fetchNeonData() {
       allEvents = [...allEvents, ...uniqueNeon];
       
       // Sort combined array descending by date
-      allEvents.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      allEvents.sort(compareNewestFirst);
       
       filterAndRender();
     }
@@ -334,9 +428,10 @@ function updateStats() {
 function updateCharts() {
   // --- 1. Timeline Chart (Events over time) ---
   const dailyData = {};
+  const dayFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
   filteredEvents.forEach(e => {
     if (e.created_at) {
-      const dateStr = new Date(e.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      const dateStr = dayFormat.format(new Date(e.created_at));
       dailyData[dateStr] = (dailyData[dateStr] || 0) + 1;
     }
   });
@@ -357,10 +452,10 @@ function updateCharts() {
   timelineChart = new Chart(ctxTimeline, {
     type: 'line',
     data: {
-      labels: timelineLabels.slice(-10), // Limit to last 10 days for clarity
+      labels: timelineLabels.slice(-30), // Last 30 days
       datasets: [{
         label: 'Event Count',
-        data: timelineValues.slice(-10),
+        data: timelineValues.slice(-30),
         borderColor: '#FF9F0A',
         borderWidth: 3,
         pointBackgroundColor: '#FF9F0A',
@@ -617,15 +712,15 @@ function exportToCSV() {
     })
   ];
 
-  // encodeURIComponent: encodeURI leaves '#' unescaped, which truncates the
-  // data URI at the first '#' in any field
-  const encodedUri = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csvRows.join('\n'));
+  // Blob instead of a data: URI, which browsers cap far below 250k+ rows
+  const url = URL.createObjectURL(new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8' }));
   const link = document.createElement('a');
-  link.setAttribute('href', encodedUri);
+  link.setAttribute('href', url);
   link.setAttribute('download', `focus_fox_analytics_${new Date().toISOString().split('T')[0]}.csv`);
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // Helper to escape HTML characters
