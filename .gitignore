@@ -1,0 +1,5 @@
+# Generated at build time from environment variables (contains keys)
+env.js
+.env
+.vercel
+node_modules/
